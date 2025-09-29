@@ -8,6 +8,7 @@ Goals:
 - Vision [not functional at this time]
 - DJ capabilities [half done]
 - TTS via voice channels [half done]
+
 Current notes:
 - I can't get CV to work because I'm a numpty
   
