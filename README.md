@@ -8,9 +8,6 @@ Goals:
 - Vision [not functional at this time]
 - DJ capabilities [half done]
 - TTS via voice channels [half done]
-
-Current notes:
-- I can't get CV to work because I'm a numpty
   
 Bugs:
 - AI loops from memory need a !memory_bust or equivalent command to inject a specific prompt to break context loops, alt fix: make the command dump some memory
@@ -25,3 +22,14 @@ Upcoming changes:
 - DJ capabilities
 - Voice
 - Replace personality files with final text prompts vs the testing promtps
+
+Current features:
+- Announce her presence [when Lio comes online, she posts a greeting in her channel]
+- Personality matrix calls one of three different personalities depending on which is most appropriate for your question [a helper, a friend, or the DJ]
+- Thread based memory [purges oldest messages at 10k]
+- Memory for specific users [gathers user messages every few thousand words and decides which things are important to remember about that person]
+- Memory system given a fallback for tricky username/ID combos
+- Responds to messages with gifs [currently set to an anime subset, you can theme this to whatever you like by simply changing the anime prefix to anything else]
+- Tell users when gifs aren't working with a playful message
+- Use emojis with each response! [will be moved to a ratio soon]
+- Response indicator [now lets you know when Lio is thinking about her response]
