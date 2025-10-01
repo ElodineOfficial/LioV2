@@ -17,8 +17,13 @@ except Exception:
 class TenorClient:
     """
     Minimal Tenor v2 client with de-dup + variety.
-    - Keeps a small rolling history of recently served GIF URLs *per query*.
-    - Randomly selects from a batch of results while excluding the recent ones.
+
+    Behavior:
+      - Keeps a small rolling history of recently served GIF URLs *per query*.
+      - Randomly selects from a batch of results while excluding the recent ones.
+      - Always prefixes the search query with 'anime ' before calling Tenor, so
+        'dance' becomes 'anime dance'. If the query already starts with 'anime '
+        (case-insensitive), it is left as-is.
 
     Env toggles (all optional):
       TENOR_API_KEY           : your key (same as before)
@@ -45,18 +50,33 @@ class TenorClient:
     def available(self) -> bool:
         return bool(self.api_key and aiohttp is not None)
 
+    def _ensure_anime_prefix(self, query: str) -> str:
+        """
+        Ensure the query begins with 'anime '.
+        If the input is empty/whitespace, return 'anime reaction'.
+        """
+        q = (query or "").strip()
+        if not q:
+            return "anime reaction"
+        if q.lower().startswith("anime "):
+            return q
+        return f"anime {q}"
+
     async def search_first_gif_url(self, query: str) -> Optional[str]:
         """
         Previous behavior: "first result wins".
         New behavior: fetch a batch, filter out last N used for this query, pick randomly.
         Keeps method name/signature for drop-in compatibility.
+        Additionally, ALWAYS prefixes 'anime ' to the provided query.
         """
         if not self.available():
             return None
 
+        prefixed_query = self._ensure_anime_prefix(query)
+
         base = "https://tenor.googleapis.com/v2/search"
         params = {
-            "q": query,
+            "q": prefixed_query,
             "key": self.api_key,
             "limit": self.search_limit,
             "media_filter": "gif,tinygif,mp4",
@@ -68,11 +88,11 @@ class TenorClient:
             async with aiohttp.ClientSession() as session:
                 async with session.get(base, params=params, timeout=10) as resp:
                     if resp.status != 200:
-                        logging.warning("Tenor response %s for query '%s'", resp.status, query)
+                        logging.warning("Tenor response %s for query '%s'", resp.status, prefixed_query)
                         return None
                     data = await resp.json()
         except Exception:
-            logging.exception("Tenor request failed for query '%s'", query)
+            logging.exception("Tenor request failed for query '%s'", prefixed_query)
             return None
 
         results = data.get("results") or []
@@ -93,8 +113,8 @@ class TenorClient:
         if not candidates:
             return None
 
-        # De-dup against the last `recent_block` picks for THIS query
-        norm_q = (query or "").strip().lower() or "<blank>"
+        # De-dup against the last `recent_block` picks for THIS (prefixed) query
+        norm_q = (prefixed_query or "").strip().lower() or "<blank>"
         async with self._lock:
             dq = self._recent_by_query.get(norm_q)
             if dq is None or dq.maxlen != self.recent_block:
