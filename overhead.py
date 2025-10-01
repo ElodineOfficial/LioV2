@@ -237,11 +237,17 @@ class Overhead:
             logging.exception("Failed trimming overhead log.")
 
     def _push_history(self, channel_id: int, decision: OverheadDecision):
-        self._route_history.setdefault(channel_id, []).append(decision.route)
+        # Always ensure the lists exist for this channel
+        routes = self._route_history.setdefault(channel_id, [])
+        emojis = self._emoji_history.setdefault(channel_id, [])
+
+        routes.append(decision.route)
         if decision.emoji:
-            self._emoji_history.setdefault(channel_id, []).append(decision.emoji)
-        self._route_history[channel_id] = self._route_history[channel_id][-20:]
-        self._emoji_history[channel_id] = self._emoji_history[channel_id][-20:]
+            emojis.append(decision.emoji)
+
+        # Trim to last 20 safely
+        self._route_history[channel_id] = routes[-20:]
+        self._emoji_history[channel_id] = emojis[-20:]
 
     # ----- emoji file -----
 
