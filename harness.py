@@ -1,8 +1,11 @@
+# harness.py
 import os
 import re
 import logging
 import asyncio
+import mimetypes
 from datetime import datetime
+from typing import List, Tuple, Optional
 
 import discord
 from dotenv import load_dotenv
@@ -18,6 +21,9 @@ from daily_post import DailyPostManager, DailyPostConfig
 
 # <<< BONK
 from bonk import BonkManager
+
+# NEW: Gemini vision summarizer
+from vision import GeminiVision
 
 try:
     from zoneinfo import ZoneInfo
@@ -45,6 +51,7 @@ class LioHarness(discord.Client):
                  overhead: Overhead, tenor: TenorClient,
                  user_memory: UserMemoryStore,
                  daily_post: DailyPostManager | None = None,
+                 cv: GeminiVision | None = None,
                  **kwargs):
         super().__init__(**kwargs)
         self.channel_id = channel_id
@@ -98,6 +105,11 @@ class LioHarness(discord.Client):
         # NEW: Global single-flight gate for mention-directed processing.
         # Ensures we never process more than one @-message at the same time.
         self._mention_gate: asyncio.Lock = asyncio.Lock()
+
+        # --- CV controls ---
+        self.cv = cv
+        self.cv_enabled = (os.getenv("CV_ENABLED", "1").strip() != "0")
+        self.cv_mentions_only = (os.getenv("CV_MENTIONS_ONLY", "1").strip() != "0")
 
     async def on_ready(self):
         if self._announced:
@@ -207,6 +219,20 @@ class LioHarness(discord.Client):
                 )
             except Exception:
                 logging.exception("Failed to persist non-mention user message.")
+
+            # Optional CV on passive messages (disabled by default)
+            if self.cv and self.cv_enabled and not self.cv_mentions_only:
+                try:
+                    cv_text = await self._summarize_attachments_if_any(message, user_text=content)
+                    if cv_text:
+                        self.store.add_user_message(
+                            channel_id=message.channel.id,
+                            author_id=message.author.id,
+                            author_name=author_name,
+                            content=cv_text,
+                        )
+                except Exception:
+                    logging.exception("CV summarize (non-mention) failed.")
             return
 
         # ------------------ SINGLE-FLIGHT SECTION ------------------
@@ -238,7 +264,22 @@ class LioHarness(discord.Client):
 
             try:
                 async with message.channel.typing():
-                    # Build recent context AFTER we've begun typing (and after persisting this turn)
+                    # === NEW: CV step ===
+                    if self.cv and self.cv_enabled:
+                        try:
+                            cv_text = await self._summarize_attachments_if_any(message, user_text=content)
+                            if cv_text:
+                                # Persist the CV summary so it's visible in the exported history
+                                self.store.add_user_message(
+                                    channel_id=message.channel.id,
+                                    author_id=message.author.id,
+                                    author_name=author_name,
+                                    content=cv_text,
+                                )
+                        except Exception:
+                            logging.exception("CV summarize (mention) failed.")
+
+                    # Build recent context AFTER the (optional) CV insert
                     history_raw = self.store.export_chat_messages(
                         channel_id=message.channel.id, include_author_names=True
                     )
@@ -317,6 +358,42 @@ class LioHarness(discord.Client):
                 logging.exception("Failed to send emoji as separate post.")
 
     # ---------- helpers ----------
+
+    async def _summarize_attachments_if_any(self, message: discord.Message, *, user_text: str) -> Optional[str]:
+        """
+        If the message has image/* attachments, fetch bytes and ask Gemini for a tiny JSON summary.
+        Returns a '[CV] {...}' string or None. Runs image fetch async; Gemini call in thread.
+        """
+        if not getattr(message, "attachments", None):
+            return None
+
+        # Collect (bytes, mime) for image attachments, up to CV_MAX_IMAGES
+        images: List[Tuple[bytes, str]] = []
+        for a in message.attachments:
+            ct = (getattr(a, "content_type", None) or "").lower().strip()
+            if not ct and getattr(a, "filename", None):
+                guessed, _ = mimetypes.guess_type(a.filename)
+                ct = (guessed or "").lower().strip()
+            if not ct.startswith("image/"):
+                continue
+            try:
+                # discord.py provides an async .read()
+                data = await a.read()
+                if data:
+                    images.append((data, ct or "image/jpeg"))
+            except Exception:
+                logging.exception("Failed reading attachment bytes.")
+                continue
+
+        if not images:
+            return None
+
+        # Run the synchronous Gemini call off the event loop.
+        try:
+            return await asyncio.to_thread(self.cv.summarize, images, user_hint=user_text)
+        except Exception:
+            logging.exception("Gemini summarize in thread failed.")
+            return None
 
     def _strip_emojis(self, text: str) -> str:
         if not text: return text
@@ -527,6 +604,18 @@ def main():
     )
     daily_post = DailyPostManager(config=daily_cfg)
 
+    # NEW: Vision (Gemini) – configurable on/off by env
+    cv = None
+    try:
+        if os.getenv("CV_ENABLED", "1").strip() != "0":
+            cv = GeminiVision(model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
+            logging.info("Gemini vision enabled (model=%s)", cv.model)
+        else:
+            logging.info("Gemini vision disabled via CV_ENABLED=0")
+    except Exception:
+        logging.exception("Failed to initialize GeminiVision; continuing without CV.")
+        cv = None
+
     intents = discord.Intents.default()
     intents.guilds = True
     intents.message_content = True
@@ -541,6 +630,7 @@ def main():
         tenor=tenor,
         user_memory=user_memory,
         daily_post=daily_post,
+        cv=cv,
         intents=intents
     )
     client.run(token)
