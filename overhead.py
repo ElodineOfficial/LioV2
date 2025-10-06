@@ -1,4 +1,3 @@
-# overhead.py
 from __future__ import annotations
 
 import os
@@ -269,3 +268,21 @@ class Overhead:
                 uniq.append(e)
                 seen.add(e)
         return uniq
+
+    # ----- NEW: emoji helpers for random reactions -----
+
+    def pick_random_emoji(self) -> Optional[str]:
+        """
+        Return a random emoji from the configured collection (emoji.txt).
+        Prefers Unicode emojis to maximize reaction success on any server,
+        but will fall back to custom-emoji entries if no Unicode is present.
+        """
+        try:
+            import random
+            if not self._emoji_list:
+                return None
+            unicode_pool = [e for e in self._emoji_list if not e.startswith("<")]
+            pool = unicode_pool if unicode_pool else self._emoji_list
+            return random.choice(pool)
+        except Exception:
+            return None
