@@ -10,15 +10,13 @@ Goals:
 - TTS via voice channels [half done]
   
 Bugs:
-- AI loops from memory need a !memory_bust or equivalent command to inject a specific prompt to break context loops, alt fix: make the command dump some memory
 - CV is traaaaaaaaaaaaaaaaaaash and my name is Oscar, two peas in a tin pod bby
 - Calls helper personality too often
 
 Upcoming changes:
 - CV IF I CAN RUB ENOUGH BRAINCELLS TOGETHER
 - Regex patterns/post processing system to fine tune responses from annoying repetition
-- Expand emoji library/move them to a new line
-- Daily post mechanic
+- Expand emoji library
 - DJ capabilities
 - Voice
 - Replace personality files with final text prompts vs the testing promtps
@@ -31,5 +29,7 @@ Current features:
 - Memory system given a fallback for tricky username/ID combos
 - Responds to messages with gifs [currently set to an anime subset, you can theme this to whatever you like by simply changing the anime prefix to anything else]
 - Tell users when gifs aren't working with a playful message
+- Daily shitposting mechanic
+- !bonk command lets you reset recent memory
 - Use emojis with each response! [will be moved to a ratio soon]
 - Response indicator [now lets you know when Lio is thinking about her response]
