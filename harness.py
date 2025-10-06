@@ -1,7 +1,7 @@
-# harness.py — use Discord typing indicator exclusively (no placeholder message)
 import os
 import re
 import logging
+import asyncio
 from datetime import datetime
 
 import discord
@@ -12,6 +12,12 @@ from chatter import Chatter, build_provider
 from overhead import Overhead, OverheadDecision
 from tenor_client import TenorClient
 from user_memory import UserMemoryStore, MemoryConfig
+
+# NEW: daily post manager
+from daily_post import DailyPostManager, DailyPostConfig
+
+# <<< BONK
+from bonk import BonkManager
 
 try:
     from zoneinfo import ZoneInfo
@@ -38,6 +44,7 @@ class LioHarness(discord.Client):
                  chatter: Chatter, store: ConversationStore,
                  overhead: Overhead, tenor: TenorClient,
                  user_memory: UserMemoryStore,
+                 daily_post: DailyPostManager | None = None,
                  **kwargs):
         super().__init__(**kwargs)
         self.channel_id = channel_id
@@ -47,10 +54,25 @@ class LioHarness(discord.Client):
         self.overhead = overhead
         self.tenor = tenor
         self.user_memory = user_memory
+        self.daily_post = daily_post
         self._announced = False
+
+        # <<< BONK
+        self.bonk = BonkManager()
 
         # Keep GIF behavior; no CV.
         self.gif_random_prob = float(os.getenv("GIF_RANDOM_PROB", "0.05"))
+
+        # UPDATED: default to a 20-30% chance to react to the user's message after replies.
+        self.react_to_user_prob = self._parse_prob(
+            os.getenv("REACT_TO_USER_PROB", "0.3"), default=0.3
+        )
+
+        # Probability of posting the emoji as a *separate* message so it renders large.
+        # Accepts "1:3", "1/3", or a decimal like "0.3333". Default is "1:9".
+        self.emoji_second_post_prob = self._parse_prob(
+            os.getenv("EMOJI_SECOND_POST_PROB", "1:9"), default=1.0 / 9.0
+        )
 
         # Emoji scrubbing for replies
         self._custom_emoji_re = re.compile(r"<a?:[A-Za-z0-9_]+:\d+>")
@@ -73,6 +95,10 @@ class LioHarness(discord.Client):
             ")"
         )
 
+        # NEW: Global single-flight gate for mention-directed processing.
+        # Ensures we never process more than one @-message at the same time.
+        self._mention_gate: asyncio.Lock = asyncio.Lock()
+
     async def on_ready(self):
         if self._announced:
             return
@@ -90,6 +116,15 @@ class LioHarness(discord.Client):
         except Exception:
             logging.exception("Failed to send connection message.")
 
+        # NEW: Schedule the once-per-day startup post
+        try:
+            if self.daily_post:
+                # Let daily-post reuse this bot's emoji scrubber for consistency.
+                self.daily_post.set_sanitizer(self._strip_emojis)
+                await self.daily_post.schedule_once(channel=channel, store=self.store)
+        except Exception:
+            logging.exception("Failed to schedule daily post.")
+
     async def on_message(self, message: discord.Message):
         # Ignore our own messages
         if message.author == self.user:
@@ -100,22 +135,55 @@ class LioHarness(discord.Client):
 
         content = message.content or ""
         author_name = getattr(message.author, "display_name", message.author.name)
+        stripped = (content or "").strip()
 
-        # Memory tap
-        try:
-            self.user_memory.note_user_text(message.author.id, author_name, content)
-        except Exception:
-            logging.exception("note_user_text failed")
+        # <<< BONK: handle command early (no mention required)
+        if stripped.lower().startswith("!bonk"):
+            # optional count: "!bonk 7"
+            parts = stripped.split()
+            count = 10
+            if len(parts) >= 2:
+                try:
+                    count = max(1, min(50, int(parts[1])))
+                except Exception:
+                    count = 10
 
-        # Persist user message
-        self.store.add_user_message(
-            channel_id=message.channel.id,
-            author_id=message.author.id,
-            author_name=author_name,
-            content=content
-        )
+            # Grab current history snapshot to anchor the bonk window.
+            try:
+                raw_hist = self.store.export_chat_messages(
+                    channel_id=message.channel.id, include_author_names=True
+                )
+            except Exception:
+                raw_hist = []
 
-        # Only respond when mentioned or replying to us
+            # If your store ever grows a deletion API, enable the hard purge here.
+            hard_purged = False
+            try:
+                hard_purged = self.bonk.try_purge_store(self.store, message.channel.id, count)
+            except Exception:
+                hard_purged = False
+
+            if hard_purged:
+                ack = f"Bonk applied, try not to jostle my circuits. {count} messages purged."
+            else:
+                effective = self.bonk.apply_bonk(message.channel.id, raw_hist, count)
+                if effective == 0:
+                    ack = "Bonk applied, but I have no assistant messages to forget in this channel, why'd you even do that?"
+                else:
+                    ack = f"Bonk applied, try not to jostle my circuits. {count} messages purged."
+
+            try:
+                await message.channel.send(ack)
+                # Record a minimal breadcrumb in the store; short and non-harmful for context.
+                self.store.add_assistant_message(
+                    channel_id=message.channel.id, content="[BONK] " + ack
+                )
+            except Exception:
+                logging.exception("Failed to send bonk ack.")
+            return
+        # <<< BONK end
+
+        # Determine whether this message targets the bot
         is_mention = (self.user in getattr(message, "mentions", []))
         is_reply_to_bot = False
         if message.reference and message.reference.resolved:
@@ -123,78 +191,130 @@ class LioHarness(discord.Client):
                 is_reply_to_bot = getattr(message.reference.resolved, "author", None).id == self.user.id
             except Exception:
                 is_reply_to_bot = False
+
+        # For non-mention chatter, keep memory + transcript as before, but do not reply.
         if not (is_mention or is_reply_to_bot):
+            try:
+                self.user_memory.note_user_text(message.author.id, author_name, content)
+            except Exception:
+                logging.exception("note_user_text failed (non-mention)")
+            try:
+                self.store.add_user_message(
+                    channel_id=message.channel.id,
+                    author_id=message.author.id,
+                    author_name=author_name,
+                    content=content
+                )
+            except Exception:
+                logging.exception("Failed to persist non-mention user message.")
             return
 
-        # ---------------------------------------------------------------
-        # Show the native Discord typing indicator for ALL processing.
-        # No 'thinking...' placeholder is posted to the chat.
-        # ---------------------------------------------------------------
-        decision: OverheadDecision | None = None
-        reply_text: str | None = None
+        # ------------------ SINGLE-FLIGHT SECTION ------------------
+        # Only one @-directed message is processed at a time.
+        async with self._mention_gate:
+            # Memory tap for mention-directed messages
+            try:
+                self.user_memory.note_user_text(message.author.id, author_name, content)
+            except Exception:
+                logging.exception("note_user_text failed (mention)")
 
-        try:
-            async with message.channel.typing():
-                # Build recent context AFTER we've begun typing
-                history = self.store.export_chat_messages(
-                    channel_id=message.channel.id, include_author_names=True
-                )
-                excerpt = "\n".join(m.content for m in history)[-1000:]
-
-                # Route selection
-                decision = self.overhead.decide(
+            # Persist the *mention* user message under the gate so history for this turn
+            # doesn't include later mentions that arrived while we were busy.
+            try:
+                self.store.add_user_message(
                     channel_id=message.channel.id,
-                    user_name=author_name,
-                    user_text=content,
-                    transcript_excerpt=excerpt,
+                    author_id=message.author.id,
+                    author_name=author_name,
+                    content=content
                 )
+            except Exception:
+                logging.exception("Failed to persist mention user message.")
 
-                # Occasional reaction GIF (kept)
-                try:
+            # ---------------------------------------------------------------
+            # Show native typing indicator for ALL processing on this turn.
+            # ---------------------------------------------------------------
+            decision: OverheadDecision | None = None
+            reply_text: str | None = None
+
+            try:
+                async with message.channel.typing():
+                    # Build recent context AFTER we've begun typing (and after persisting this turn)
+                    history_raw = self.store.export_chat_messages(
+                        channel_id=message.channel.id, include_author_names=True
+                    )
+                    # <<< BONK: filter assistant msgs per active bonks
+                    history = self.bonk.filter_history(message.channel.id, history_raw)
+                    excerpt = "\n".join(m.content for m in history)[-1000:]
+
+                    # Route selection
+                    decision = self.overhead.decide(
+                        channel_id=message.channel.id,
+                        user_name=author_name,
+                        user_text=content,
+                        transcript_excerpt=excerpt,
+                    )
+
+                    # Occasional reaction GIF (kept)
+                    try:
+                        import random
+                        if decision.route != "GIF":
+                            if random.random() < self.gif_random_prob:
+                                decision = OverheadDecision(
+                                    route="GIF",
+                                    emoji=decision.emoji,
+                                    gif_query=self._derive_gif_query(content),
+                                    raw_command="RANDOM_GIF",
+                                )
+                    except Exception:
+                        logging.exception("Random GIF overlay failed.")
+
+                    # If GIF route, do the GIF work (including Tenor search) while typing
+                    if decision.route == "GIF":
+                        # Send GIF reply and maybe react to the user's message (probability gate)
+                        await self._send_gif_reply(message, decision)
+                        return  # gate released automatically on 'async with' exit
+
+                    # Otherwise, generate text reply while typing
+                    persona_map = {
+                        "A": os.getenv("PERSONALITY_A_PATH", "personalityA.txt"),
+                        "B": os.getenv("PERSONALITY_B_PATH", "personalityB.txt"),
+                        "C": os.getenv("PERSONALITY_C_PATH", "personalityC.txt"),
+                    }
+                    system_prompt = self._load_text_file_safe(persona_map.get(decision.route, "personalityA.txt"))
+
+                    try:
+                        reply_text = await self.chatter.generate_reply_with_system_async(history, system_prompt)
+                    except Exception:
+                        logging.exception("Chatter generation failed.")
+                        reply_text = "My brain farted. Try again?"
+            except Exception:
+                logging.exception("Unexpected failure in on_message processing (mention).")
+                reply_text = "My brain farted. Try again?"
+
+            # Send final output (typing indicator stops automatically here)
+            # 1) Scrub any emojis from the LLM text to ensure emojis are never inline.
+            text_only = self._strip_emojis(reply_text or "") or "…"
+
+            try:
+                await message.channel.send(text_only)
+                self.store.add_assistant_message(channel_id=message.channel.id, content=text_only)
+            except Exception:
+                logging.exception("Failed to send persona reply.")
+
+            # Maybe react to the user's message with a random emoji (probability gate).
+            await self._react_randomly_to_user_message(message)
+
+            # 2) Optionally post the chosen emoji as a separate follow-up (unchanged behavior).
+            try:
+                if decision and decision.emoji:
                     import random
-                    if decision.route != "GIF":
-                        if random.random() < self.gif_random_prob:
-                            decision = OverheadDecision(
-                                route="GIF",
-                                emoji=decision.emoji,
-                                gif_query=self._derive_gif_query(content),
-                                raw_command="RANDOM_GIF",
-                            )
-                except Exception:
-                    logging.exception("Random GIF overlay failed.")
-
-                # If GIF route, do the GIF work (including Tenor search) while typing
-                if decision.route == "GIF":
-                    await self._send_gif_reply(message.channel, decision)
-                    return
-
-                # Otherwise, generate text reply while typing
-                persona_map = {
-                    "A": os.getenv("PERSONALITY_A_PATH", "personalityA.txt"),
-                    "B": os.getenv("PERSONALITY_B_PATH", "personalityB.txt"),
-                    "C": os.getenv("PERSONALITY_C_PATH", "personalityC.txt"),
-                }
-                system_prompt = self._load_text_file_safe(persona_map.get(decision.route, "personalityA.txt"))
-
-                try:
-                    reply_text = await self.chatter.generate_reply_with_system_async(history, system_prompt)
-                except Exception:
-                    logging.exception("Chatter generation failed.")
-                    reply_text = "My brain farted. Try again?"
-        except Exception:
-            logging.exception("Unexpected failure in on_message processing.")
-            reply_text = "My brain farted. Try again?"
-
-        # Send final output (typing indicator stops automatically here)
-        reply_text = self._strip_emojis(reply_text or "") or "…"
-        if decision and decision.emoji:
-            reply_text = f"{reply_text} {decision.emoji}"
-
-        try:
-            await message.channel.send(reply_text)
-            self.store.add_assistant_message(channel_id=message.channel.id, content=reply_text)
-        except Exception:
-            logging.exception("Failed to send persona reply.")
+                    if random.random() < self.emoji_second_post_prob:
+                        await message.channel.send(decision.emoji)
+                        self.store.add_assistant_message(
+                            channel_id=message.channel.id, content=decision.emoji
+                        )
+            except Exception:
+                logging.exception("Failed to send emoji as separate post.")
 
     # ---------- helpers ----------
 
@@ -241,29 +361,97 @@ class LioHarness(discord.Client):
             return "brb reaction"
         return "reaction"
 
-    async def _send_gif_reply(self, channel: discord.TextChannel, decision: OverheadDecision):
+    async def _send_gif_reply(self, source_message: discord.Message, decision: OverheadDecision):
+        """
+        Send the GIF reply to the channel, then maybe react to the *user's* original message
+        with a random emoji (probability gate).
+        """
+        channel: discord.TextChannel = source_message.channel  # type: ignore[assignment]
         url = await self.tenor.search_first_gif_url(decision.gif_query or "reaction")
         if url:
             try:
-                sent = await channel.send(url)
-                if decision.emoji:
-                    from discord import PartialEmoji
-                    try:
-                        await sent.add_reaction(PartialEmoji.from_str(decision.emoji) if decision.emoji.startswith("<:") else decision.emoji)
-                    except Exception:
-                        pass
+                await channel.send(url)
+                # Maybe react to the user's message with a random emoji (probability gate).
+                await self._react_randomly_to_user_message(source_message)
                 self.store.add_assistant_message(channel_id=channel.id, content=f"[GIF] {url}")
                 return
             except Exception:
                 logging.exception("Failed sending GIF.")
+        # Fallback: textual hint if no GIF URL
         fallback = f"*{decision.gif_query or 'reaction'}*"
         try:
-            sent = await channel.send(fallback)
-            if decision.emoji:
-                await sent.add_reaction(decision.emoji)
+            await channel.send(fallback)
+            await self._react_randomly_to_user_message(source_message)
             self.store.add_assistant_message(channel_id=channel.id, content=fallback)
         except Exception:
             logging.exception("Failed sending GIF fallback.")
+
+    async def _maybe_react_to_user_message(self, user_message: discord.Message, emoji: str | None) -> None:
+        """
+        Legacy helper: used to react to the *user's* message with a chosen emoji and a probability gate.
+        Kept for compatibility, but new code prefers _react_randomly_to_user_message.
+        """
+        try:
+            import random
+            if not emoji:
+                return
+            if random.random() >= self.react_to_user_prob:
+                return
+            from discord import PartialEmoji
+            try:
+                # Support both '<:name:id>' and '<a:name:id>' custom emoji strings via PartialEmoji
+                await user_message.add_reaction(
+                    PartialEmoji.from_str(emoji) if emoji.startswith("<") else emoji
+                )
+            except Exception:
+                # Swallow reaction errors silently (missing perms, emoji not in guild, etc.)
+                pass
+        except Exception:
+            logging.exception("Failed during maybe-react-to-user logic.")
+
+    async def _react_randomly_to_user_message(self, user_message: discord.Message) -> None:
+        """
+        Attempt to react to the user's message with a random emoji from Overhead's collection,
+        based on self.react_to_user_prob (default 20-30%). Prefers Unicode emojis for higher success;
+        retries a few times if a chosen emoji fails.
+        """
+        try:
+            import random
+            if random.random() >= self.react_to_user_prob:
+                return
+            from discord import PartialEmoji
+            attempts = 4
+            for _ in range(attempts):
+                emoji = self.overhead.pick_random_emoji()
+                if not emoji:
+                    return
+                try:
+                    await user_message.add_reaction(
+                        PartialEmoji.from_str(emoji) if emoji.startswith("<") else emoji
+                    )
+                    return
+                except Exception:
+                    # Try another random emoji if this one isn't usable (e.g., custom emoji not in guild)
+                    continue
+        except Exception:
+            logging.exception("Failed during random react-to-user logic.")
+
+    def _parse_prob(self, s: str, default: float) -> float:
+        """
+        Parse a probability from strings like '1:3', '1/3', or '0.3333'.
+        Returns 'default' on any error.
+        """
+        try:
+            s = (s or "").strip()
+            if ":" in s:
+                a, b = s.split(":", 1)
+                return float(a) / float(b)
+            if "/" in s:
+                a, b = s.split("/", 1)
+                return float(a) / float(b)
+            return float(s)
+        except Exception:
+            return default
 
     async def _resolve_channel(self) -> discord.TextChannel | None:
         if self.channel_id:
@@ -327,6 +515,18 @@ def main():
     )
     tenor = TenorClient(api_key=os.getenv("TENOR_API_KEY"))
 
+    # NEW: Daily post manager config from env
+    daily_cfg = DailyPostConfig(
+        posts_path=os.getenv("DAILY_POSTS_PATH", "daily_posts.json"),
+        state_path=os.getenv("DAILY_POST_STATE_PATH", "daily_post_state.json"),
+        enabled=(os.getenv("DAILY_POST_ENABLED", "1").strip() != "0"),
+        min_delay_sec=int(os.getenv("DAILY_POST_MIN_DELAY_SEC", "300")),
+        max_delay_sec=int(os.getenv("DAILY_POST_MAX_DELAY_SEC", "600")),
+        cooldown_hours=int(os.getenv("DAILY_POST_COOLDOWN_HOURS", "24")),
+        tz_env_var=os.getenv("DAILY_POST_TZ_ENV", "TZ")
+    )
+    daily_post = DailyPostManager(config=daily_cfg)
+
     intents = discord.Intents.default()
     intents.guilds = True
     intents.message_content = True
@@ -340,6 +540,7 @@ def main():
         overhead=overhead,
         tenor=tenor,
         user_memory=user_memory,
+        daily_post=daily_post,
         intents=intents
     )
     client.run(token)
